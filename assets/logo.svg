@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="NEXO WEB GUARD">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 3 56 12v18c0 15-10.5 26.5-24 31C18.500 56.500 8 45 8 30V12z" fill="#0a1628" stroke="url(#g)" stroke-width="3" stroke-linejoin="round"/>
+  <g stroke="url(#g)" stroke-width="2.200" stroke-linecap="round" fill="none">
+    <path d="M32 18 21 30M32 18 43 30M21 30 32 44M43 30 32 44M21 30h22"/>
+  </g>
+  <g fill="#2dd4bf">
+    <circle cx="32" cy="18" r="3.500"/>
+    <circle cx="21" cy="30" r="3"/>
+    <circle cx="43" cy="30" r="3"/>
+  </g>
+  <circle cx="32" cy="44" r="3.500" fill="#3b82f6"/>
+</svg>
