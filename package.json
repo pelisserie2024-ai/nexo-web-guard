@@ -1,0 +1,16 @@
+{
+  "name": "nexo-web-guard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NEXO WEB GUARD - análisis defensivo y no intrusivo de seguridad web",
+  "scripts": {
+    "build": "node scripts/copy-vendor.js",
+    "test": "node tests/run-tests.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "jspdf": "^3.0.1"
+  }
+}
