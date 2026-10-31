@@ -11,7 +11,7 @@ const { detectTechnologies, findMixedContent } = require('./detect');
 const { analyzeSecurityHeaders } = require('./headers-analysis');
 const { phpSupportStatus } = require('./php-support');
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.4.0';
 const MAX_REQUESTS = 10;
 const TOTAL_MS = 8500;
 const CMS_IDS = ['wordpress', 'joomla', 'drupal'];
@@ -455,7 +455,7 @@ async function runAnalysis(rawUrl, deps, opts) {
       result.php.message = 'Versión declarada ' + result.php.version + '. ' + sup.note;
     }
   } else if (result.php.status === 'No detectado') {
-    result.php.message = 'No se detectaron indicios de PHP. La ausencia de señales no demuestra que no se utilice.';
+    result.php.message = result.php.note;
   } else {
     result.php.message = 'No se ha podido confirmar la versión de PHP desde el análisis externo. Se necesita una comprobación autorizada del servidor para verificarla.';
   }

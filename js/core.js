@@ -118,7 +118,67 @@
   function finalize(result) {
     result.risk = computeRisk(result);
     result.prioritized = sortFindings(result.findings).filter(function (f) { return f.severity !== 'Informativo'; });
+    result.summary = buildSummary(result);
     return result;
+  }
+
+  /**
+   * Fusiona la salida de un módulo adicional (infraestructura, dominio, subdominios) en el resultado.
+   * key: propiedad donde se guarda el módulo; failText: frase para la limitación si el módulo falló.
+   * Las limitaciones idénticas se conservan una sola vez y las fuentes se unifican por URL.
+   */
+  function mergeModule(result, key, data, failText) {
+    result.findings = result.findings || [];
+    result.limitations = result.limitations || [];
+    result.sources = result.sources || [];
+    var add = function (list) {
+      (list || []).forEach(function (t) { if (result.limitations.indexOf(t) < 0) result.limitations.push(t); });
+    };
+    if (data && !data.error && data.host) {
+      result[key] = data;
+      result.findings = result.findings.concat(data.findings || []);
+      add(data.limitations);
+      var known = {};
+      result.sources.forEach(function (s) { known[s.url] = true; });
+      (data.sources || []).forEach(function (s) { if (!known[s.url]) { known[s.url] = true; result.sources.push(s); } });
+    } else {
+      result[key] = null;
+      add([failText + (data && data.error ? ' (' + data.error + ')' : '') + '.']);
+    }
+    return result;
+  }
+
+  /** Resumen ejecutivo: solo datos presentes en el resultado; nada se estima ni se inventa. */
+  function buildSummary(r) {
+    var risk = r.risk || computeRisk(r);
+    var out = { level: risk.level, incomplete: !!risk.incomplete, headline: '', points: [], priorities: [] };
+    if (risk.incomplete) {
+      out.headline = risk.message;
+      return out;
+    }
+    out.headline = 'Riesgo observado: ' + risk.level + '. ' + risk.basis;
+    var pri = r.prioritized || sortFindings(r.findings).filter(function (f) { return f.severity !== 'Informativo'; });
+    out.priorities = pri.slice(0, 3).map(function (f) {
+      return { id: f.id, title: f.title, severity: f.severity, confidence: f.confidence, recommendation: f.recommendation || '' };
+    });
+    var h = r.https || {};
+    if (h.available) out.points.push('HTTPS: ' + h.available + (h.certificate && typeof h.certificate.daysLeft === 'number' ? ' (certificado válido durante ' + h.certificate.daysLeft + ' días más)' : ''));
+    var conf = (r.technologies || []).filter(function (t) { return t.status === 'Confirmado'; }).map(function (t) { return t.name; });
+    if (conf.length) out.points.push('Tecnologías confirmadas: ' + conf.join(', '));
+    var v = r.vulnerabilities || [];
+    if (v.length) {
+      var byClass = { A: 0, B: 0, C: 0 };
+      v.forEach(function (x) { if (byClass[x.classification] !== undefined) byClass[x.classification]++; });
+      out.points.push('CVE publicados relacionados: ' + v.length + ' (clase A: ' + byClass.A + ', B: ' + byClass.B + ', C: ' + byClass.C + '). No demuestran que el sitio sea vulnerable.');
+    }
+    var all = (r.findings || []);
+    out.points.push('Hallazgos: ' + all.length + ' en total, ' + pri.length + ' de gravedad Baja o superior.');
+    var missing = [];
+    if (r.infrastructure === null) missing.push('infraestructura y DNS');
+    if (r.domainIntel === null) missing.push('dominio y ubicación');
+    if (r.subdomains === null) missing.push('subdominios');
+    if (missing.length) out.points.push('Análisis no completados (repetir): ' + missing.join(', ') + '.');
+    return out;
   }
 
   /** Estructura del archivo JSON exportado. */
@@ -133,7 +193,7 @@
   return {
     SEVERITIES: SEVERITIES, INCOMPLETE_MESSAGE: INCOMPLETE_MESSAGE, CLASS_LABEL: CLASS_LABEL,
     validateUrl: validateUrl, cveUrl: cveUrl, effectiveSeverity: effectiveSeverity, normalizeVulns: normalizeVulns,
-    computeRisk: computeRisk, sortFindings: sortFindings, finalize: finalize, buildJsonExport: buildJsonExport,
+    computeRisk: computeRisk, sortFindings: sortFindings, finalize: finalize, mergeModule: mergeModule, buildSummary: buildSummary, buildJsonExport: buildJsonExport,
     pdfFileName: pdfFileName, sevIndex: sevIndex
   };
 });

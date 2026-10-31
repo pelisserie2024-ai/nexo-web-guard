@@ -509,6 +509,450 @@ test('app.js define los botones exigidos', () => {
   ['DESCARGAR INFORME PDF', 'EXPORTAR JSON', 'VOLVER A ANALIZAR', 'LIMPIAR RESULTADOS'].forEach((t) => assert.ok(s.includes(t), t));
 });
 
+/* ---------- infraestructura y DNS ---------- */
+const infra = require(path.join(root, 'netlify/lib/infra'));
+const infraH = require(path.join(root, 'netlify/functions/infrastructure')).handler;
+const dnsErr = (code) => { const e = new Error(code); e.code = code; return e; };
+function mockResolver(map) {
+  const get = (kind, name) => {
+    const k = kind + ':' + name;
+    if (!(k in map)) throw dnsErr('ENODATA');
+    const v = map[k];
+    if (v instanceof Error) throw v;
+    return v;
+  };
+  return {
+    resolve4: async (n) => get('A', n), resolve6: async (n) => get('AAAA', n), resolveCname: async (n) => get('CNAME', n),
+    resolveNs: async (n) => get('NS', n), resolveMx: async (n) => get('MX', n), resolveTxt: async (n) => get('TXT', n),
+    resolveCaa: async (n) => get('CAA', n), reverse: async (ip) => get('PTR', ip)
+  };
+}
+test('registrableDomain: dominios comunes, .cl con subniveles y plataformas', () => {
+  assert.strictEqual(infra.registrableDomain('www.ejemplo.cl'), 'ejemplo.cl');
+  assert.strictEqual(infra.registrableDomain('ejemplo.cl'), 'ejemplo.cl');
+  assert.strictEqual(infra.registrableDomain('a.b.ejemplo.com'), 'ejemplo.com');
+  assert.strictEqual(infra.registrableDomain('shop.empresa.com.cl'), 'empresa.com.cl');
+  assert.strictEqual(infra.registrableDomain('mi-sitio.netlify.app'), 'mi-sitio.netlify.app');
+  assert.strictEqual(infra.registrableDomain('www.mi-sitio.netlify.app'), 'mi-sitio.netlify.app');
+});
+test('originName para Team Cymru (IPv4 e IPv6)', () => {
+  assert.strictEqual(infra.originName('8.8.4.4', 4), '4.4.8.8.origin.asn.cymru.com');
+  const v6 = infra.originName('2606:4700:4700::1111', 6);
+  assert.ok(v6.endsWith('.origin6.asn.cymru.com'));
+  assert.strictEqual(v6.split('.').length - 4, 32, '32 nibbles');
+  assert.ok(v6.startsWith('1.1.1.1.'));
+});
+test('SPF y DMARC: evaluaciones', () => {
+  assert.strictEqual(infra.analyzeSpf([]).assessment, 'Ausente');
+  assert.strictEqual(infra.analyzeSpf(['v=spf1 include:_spf.google.com -all']).assessment, 'Correcto');
+  assert.strictEqual(infra.analyzeSpf(['v=spf1 include:x ~all']).assessment, 'Aceptable');
+  assert.strictEqual(infra.analyzeSpf(['v=spf1 +all']).assessment, 'Inseguro');
+  assert.strictEqual(infra.analyzeSpf(['v=spf1 all']).assessment, 'Inseguro');
+  assert.strictEqual(infra.analyzeSpf(['v=spf1 -all', 'v=spf1 ~all']).assessment, 'Revisar');
+  assert.strictEqual(infra.analyzeDmarc([]).assessment, 'Ausente');
+  assert.strictEqual(infra.analyzeDmarc(['v=DMARC1; p=none; rua=mailto:a@x.cl']).assessment, 'Monitoreo');
+  assert.strictEqual(infra.analyzeDmarc(['v=DMARC1; p=reject; pct=50']).assessment, 'Correcto');
+  assert.ok(/50%/.test(infra.analyzeDmarc(['v=DMARC1; p=reject; pct=50']).note));
+});
+const CF_MAP = {
+  'A:www.ejemplo.cl': ['104.16.1.1'], 'NS:ejemplo.cl': ['ana.ns.cloudflare.com', 'bob.ns.cloudflare.com'],
+  'MX:ejemplo.cl': [{ exchange: 'mx2.mail.com', priority: 20 }, { exchange: 'mx1.mail.com', priority: 10 }],
+  'TXT:ejemplo.cl': [['v=spf1 include:mail.com ~all']],
+  'PTR:104.16.1.1': ['cdn.cloudflare.com'],
+  'TXT:1.1.16.104.origin.asn.cymru.com': [['13335 | 104.16.0.0/13 | US | arin | 2014-03-28']],
+  'TXT:AS13335.asn.cymru.com': [['13335 | US | arin | 2010-07-14 | CLOUDFLARENET, US']]
+};
+test('infra.run: IP, ASN, proveedor, correo y hallazgos (DNS simulado)', async () => {
+  const r = await infra.run('www.ejemplo.cl', { resolver: mockResolver(CF_MAP), now: () => new Date('2026-10-30T12:00:00Z') });
+  assert.strictEqual(r.domain, 'ejemplo.cl');
+  assert.strictEqual(r.available, true);
+  assert.strictEqual(r.ips[0].asn, 'AS13335');
+  assert.strictEqual(r.ips[0].country, 'US');
+  assert.strictEqual(r.ips[0].asName, 'CLOUDFLARENET, US');
+  assert.deepStrictEqual(r.ips[0].ptr, ['cdn.cloudflare.com']);
+  assert.ok(r.hosting.some((h) => h.name === 'Cloudflare' && h.role === 'CDN / protección'));
+  assert.ok(r.hosting.some((h) => h.name === 'Cloudflare' && h.role === 'Proveedor de DNS'));
+  assert.deepStrictEqual(r.records.MX.values, ['10 mx1.mail.com', '20 mx2.mail.com'], 'MX ordenado por prioridad');
+  assert.strictEqual(r.email.receivesMail, true);
+  assert.strictEqual(r.email.spf.assessment, 'Aceptable');
+  const titles = r.findings.map((f) => f.title).join(' | ');
+  assert.ok(/no publica DMARC/.test(titles));
+  assert.ok(/no define registros CAA/.test(titles));
+  assert.ok(/Infraestructura detectada: Cloudflare/.test(titles));
+  assert.ok(r.findings.every((f) => /^NWG-I\d{3}$/.test(f.id) && f.severity && f.confidence));
+  assert.ok(r.limitations.some((l) => /no la ubicación física|no es la ubicación física|registro del bloque IP/.test(l)));
+});
+test('infra.run: IP privada en DNS público no se consulta y genera hallazgo', async () => {
+  const seen = [];
+  const base = mockResolver({ 'A:interno.ejemplo.cl': ['10.0.0.5'], 'NS:ejemplo.cl': ['a.ns', 'b.ns'] });
+  const spy = Object.assign({}, base, { reverse: async (ip) => { seen.push(ip); return []; }, resolveTxt: async (n) => { seen.push(n); throw dnsErr('ENODATA'); } });
+  const r = await infra.run('interno.ejemplo.cl', { resolver: spy });
+  assert.strictEqual(r.ips[0].public, false);
+  assert.ok(!seen.some((x) => /10\.0\.0\.5|5\.0\.0\.10/.test(x)), 'no debe consultarse PTR/ASN de IP privadas');
+  assert.ok(r.findings.some((f) => /no pública/.test(f.title)));
+});
+test('infra.run: CNAME colgante, un solo NS y dominio sin correo', async () => {
+  const r = await infra.run('blog.ejemplo.cl', { resolver: mockResolver({
+    'CNAME:blog.ejemplo.cl': ['abandonado.herokuapp.com'], 'A:blog.ejemplo.cl': [dnsErr('ENODATA')], 'NS:ejemplo.cl': ['solo.ns.com'],
+    'A:abandonado.herokuapp.com': dnsErr('ENOTFOUND'), 'AAAA:abandonado.herokuapp.com': dnsErr('ENOTFOUND')
+  }) });
+  const titles = r.findings.map((f) => f.title).join(' | ');
+  assert.ok(/subdomain takeover/.test(titles));
+  assert.ok(/un solo servidor de nombres/.test(titles));
+  assert.strictEqual(r.email.receivesMail, false);
+  assert.ok(/Dominio sin correo y sin SPF/.test(titles));
+  assert.ok(r.hosting.some((h) => h.name === 'Heroku'));
+});
+test('infra.run: si el DNS no responde se marca como no disponible sin inventar datos', async () => {
+  const t = dnsErr('ETIMEOUT');
+  const r = await infra.run('www.ejemplo.cl', { resolver: mockResolver({ 'A:www.ejemplo.cl': t, 'AAAA:www.ejemplo.cl': t, 'CNAME:www.ejemplo.cl': t, 'NS:ejemplo.cl': t }) });
+  assert.strictEqual(r.available, false);
+  assert.strictEqual(r.findings.length, 0);
+  assert.strictEqual(r.ips.length, 0);
+});
+test('infra.run: dominio sin ningún registro no genera hallazgos engañosos', async () => {
+  const r = await infra.run('noexiste.ejemplo.cl', { resolver: mockResolver({ 'A:noexiste.ejemplo.cl': dnsErr('ENOTFOUND'), 'AAAA:noexiste.ejemplo.cl': dnsErr('ENOTFOUND'), 'NS:ejemplo.cl': dnsErr('ENOTFOUND') }) });
+  assert.strictEqual(r.noRecords, true);
+  assert.strictEqual(r.findings.length, 0);
+  assert.strictEqual(r.email, null);
+  assert.ok(/ningún registro DNS/.test(r.limitations[0]));
+});
+test('infrastructure handler: valida método, origen y URL', async () => {
+  rateLimit.reset();
+  assert.strictEqual((await infraH({ httpMethod: 'GET', headers: {} })).statusCode, 405);
+  assert.strictEqual((await infraH(ev({ headers: { host: 'sitio.netlify.app', origin: 'https://otro.com' }, body: '{}' }))).statusCode, 403);
+  assert.strictEqual((await infraH(ev({ body: JSON.stringify({ url: 'http://127.0.0.1' }) }))).statusCode, 400);
+  assert.strictEqual((await infraH(ev({ body: JSON.stringify({ url: 'http://localhost' }) }))).statusCode, 400);
+  assert.strictEqual((await infraH(ev({ body: JSON.stringify({ url: 'ftp://ejemplo.cl' }) }))).statusCode, 400);
+});
+test('el PDF incluye la sección de infraestructura con datos reales', () => {
+  const r = {
+    reportId: 'NWG-X', appVersion: '1.1.0', analyzedAt: '2026-10-30T12:00:00Z', requestedUrl: 'https://www.ejemplo.cl/', finalUrl: 'https://www.ejemplo.cl/', host: 'www.ejemplo.cl', status: 'completed',
+    https: {}, technologies: [], php: null, headers: [], findings: [], vulnLookups: [], vulnerabilities: [], vulnLookupErrors: [], notPerformed: [], limitations: [], sources: [],
+    infrastructure: { host: 'www.ejemplo.cl', domain: 'ejemplo.cl', available: true,
+      ips: [{ ip: '104.16.1.1', public: true, ptr: ['cdn.cloudflare.com'], asn: 'AS13335', asName: 'CLOUDFLARENET, US', prefix: '104.16.0.0/13', country: 'US', registry: 'arin' }],
+      hosting: [{ name: 'Cloudflare', role: 'CDN / protección', confidence: 'Media', evidence: ['104.16.1.1 pertenece a AS13335'] }],
+      records: { A: { status: 'presente', values: ['104.16.1.1'] }, MX: { status: 'presente', values: ['10 mx1.mail.com'] } },
+      email: { domain: 'ejemplo.cl', receivesMail: true, spf: { assessment: 'Aceptable', note: 'ok', value: 'v=spf1 ~all' }, dmarc: { assessment: 'Ausente', note: 'No se encontró', value: null }, dkim: 'No verificable con las comprobaciones disponibles' } }
+  };
+  Core.finalize(r);
+  const mock = new MockJsPDF();
+  Pdf.build(function () { return mock; }, r, Core);
+  const all = mock.calls.texts.join('\n');
+  ['5. Infraestructura y DNS', 'AS13335', 'CLOUDFLARENET', 'Cloudflare', 'No verificable con las comprobaciones disponibles', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+});
+test('análisis: el mensaje de PHP no se duplica cuando no se detecta', async () => {
+  const fetchFollow = stubFetch({
+    'https://ejemplo.cl/robots.txt': { finalUrl: 'x', chain: [], response: { status: 404, headers: {}, body: '' } },
+    'http://ejemplo.cl/': { finalUrl: 'x', chain: [], response: { status: 301, headers: { location: 'https://ejemplo.cl/' }, body: '' } },
+    'https://ejemplo.cl/': { finalUrl: 'https://ejemplo.cl/', chain: [{ url: 'https://ejemplo.cl/', status: 200 }], response: { status: 200, headers: {}, body: '<html></html>', tls: goodTls } }
+  });
+  const r = await runAnalysis('https://ejemplo.cl', { fetchFollow });
+  assert.strictEqual(r.php.status, 'No detectado');
+  assert.strictEqual(r.php.message, r.php.note);
+});
+
+/* ---------- Fase 2: dominio (RDAP), ubicación y DNSSEC ---------- */
+const intel = require(path.join(root, 'netlify/lib/domain-intel'));
+const intelH = require(path.join(root, 'netlify/functions/domain-intel')).handler;
+function resp(status, body, headers) {
+  return { status, ok: status >= 200 && status < 300, headers: { get: (k) => (headers || {})[String(k).toLowerCase()] || null }, text: async () => (typeof body === 'string' ? body : JSON.stringify(body)) };
+}
+const RDAP_OK = {
+  events: [{ eventAction: 'registration', eventDate: '2020-05-01T00:00:00Z' }, { eventAction: 'expiration', eventDate: '2026-11-15T00:00:00Z' }, { eventAction: 'last changed', eventDate: '2026-01-10T00:00:00Z' }],
+  status: ['client transfer prohibited', 'active'],
+  entities: [{ roles: ['registrant'], vcardArray: ['vcard', [['fn', {}, 'text', 'PERSONA PRIVADA']]] }, { roles: ['registrar'], vcardArray: ['vcard', [['version', {}, 'text', '4.0'], ['fn', {}, 'text', 'Registrador Ejemplo SpA']]] }],
+  nameservers: [{ ldhName: 'NS1.EJEMPLO.CL' }]
+};
+function fakeServices(over) {
+  const calls = [];
+  const o = over || {};
+  const fetch = async (url) => {
+    calls.push(url);
+    const u = new URL(url);
+    if (u.host === 'rdap.org') return o.rdap ? o.rdap(url) : resp(200, RDAP_OK);
+    if (u.host === 'dns.google') return o.doh ? o.doh(url) : resp(200, { Status: 0, AD: false, Answer: [] });
+    if (u.host === 'ipwho.is') return o.geo ? o.geo(url) : resp(200, { success: true, country: 'Chile', country_code: 'CL', region: 'Región Metropolitana', city: 'Santiago', latitude: -33.45, longitude: -70.66, connection: { asn: 1234, org: 'Proveedor SA' }, timezone: { id: 'America/Santiago' } });
+    throw new Error('host inesperado: ' + u.host);
+  };
+  return { fetch, calls };
+}
+const pubLookup = async () => [{ address: '93.184.216.34', family: 4 }];
+test('RDAP: se extraen fechas, registrador y estados sin exponer datos del titular', () => {
+  const r = intel.parseRdap(RDAP_OK);
+  assert.strictEqual(r.registrar, 'Registrador Ejemplo SpA');
+  assert.strictEqual(r.expiration, '2026-11-15T00:00:00Z');
+  assert.deepStrictEqual(r.nameservers, ['ns1.ejemplo.cl']);
+  assert.ok(!JSON.stringify(r).includes('PERSONA PRIVADA'));
+});
+test('domain-intel: RDAP + ubicación + DNSSEC y hallazgos (servicios simulados)', async () => {
+  const svc = fakeServices({ doh: () => resp(200, { Status: 0, AD: true, Answer: [{ type: 43, data: '1 13 2 abc' }] }) });
+  const r = await intel.run('www.ejemplo.cl', { fetch: svc.fetch, resolver: mockResolver({ 'A:www.ejemplo.cl': ['93.184.216.34'], 'AAAA:www.ejemplo.cl': [dnsErr('ENODATA')] }), lookup: pubLookup, now: () => new Date('2026-10-30T12:00:00Z') });
+  assert.strictEqual(r.rdap.status, 'ok');
+  assert.strictEqual(r.rdap.daysToExpire, 15);
+  assert.ok(r.findings.some((f) => /vence en 15 días/.test(f.title) && f.severity === 'Bajo'));
+  assert.strictEqual(r.geo[0].country, 'Chile');
+  assert.strictEqual(r.geo[0].timezone, 'America/Santiago');
+  assert.strictEqual(r.dnssec.status, 'firmado');
+  assert.strictEqual(r.dnssec.validated, true);
+  assert.ok(!r.findings.some((f) => /DNSSEC/.test(f.title)));
+  assert.ok(!r.findings.some((f) => /bloqueo de transferencia/.test(f.title)), 'tiene transfer lock');
+  assert.ok(r.findings.every((f) => /^NWG-D\d{3}$/.test(f.id)));
+  const hosts = svc.calls.map((u) => new URL(u).host);
+  assert.ok(hosts.every((h) => ['rdap.org', 'dns.google', 'ipwho.is'].includes(h)), 'solo destinos fijos: ' + hosts);
+});
+test('domain-intel: dominio vencido, reciente, sin DNSSEC y sin bloqueo de transferencia', async () => {
+  const svc = fakeServices({
+    rdap: () => resp(200, { events: [{ eventAction: 'registration', eventDate: '2026-10-20T00:00:00Z' }, { eventAction: 'expiration', eventDate: '2026-10-01T00:00:00Z' }], status: ['active'] }),
+    doh: () => resp(200, { Status: 0, Answer: [] })
+  });
+  const r = await intel.run('ejemplo.cl', { fetch: svc.fetch, resolver: mockResolver({}), lookup: pubLookup, now: () => new Date('2026-10-30T12:00:00Z') });
+  const t = r.findings.map((f) => f.severity + ':' + f.title).join(' | ');
+  assert.ok(/Alto:El dominio figura como vencido/.test(t));
+  assert.ok(/registrado hace menos de 30 días/.test(t));
+  assert.ok(/no tiene DNSSEC/.test(t));
+  assert.ok(/no muestra bloqueo de transferencia/.test(t));
+  assert.strictEqual(r.dnssec.status, 'no firmado');
+});
+test('domain-intel: subdominio de plataforma no consulta RDAP ni DNSSEC', async () => {
+  const svc = fakeServices();
+  const r = await intel.run('mi-sitio.netlify.app', { fetch: svc.fetch, resolver: mockResolver({ 'A:mi-sitio.netlify.app': ['93.184.216.34'] }), lookup: pubLookup });
+  assert.strictEqual(r.rdap.status, 'no aplica');
+  assert.strictEqual(r.dnssec.status, 'no aplica');
+  assert.ok(!svc.calls.some((u) => /rdap\.org|dns\.google/.test(u)));
+  assert.strictEqual(r.findings.length, 0);
+});
+test('domain-intel: IP privadas nunca se envían al servicio de ubicación', async () => {
+  const svc = fakeServices();
+  const r = await intel.run('interno.ejemplo.cl', { fetch: svc.fetch, resolver: mockResolver({ 'A:interno.ejemplo.cl': ['10.0.0.5', '192.168.1.9'], 'AAAA:interno.ejemplo.cl': ['::1'] }), lookup: pubLookup });
+  assert.ok(!svc.calls.some((u) => /ipwho\.is/.test(u)));
+  assert.strictEqual(r.geo.length, 0);
+});
+test('domain-intel: redirección RDAP legítima se sigue; hacia IP/interno/http se bloquea', async () => {
+  let r = await intel.lookupRdap('ejemplo.cl', { lookup: pubLookup, fetch: (() => { let n = 0; return async () => (n++ === 0 ? resp(302, '', { location: 'https://rdap.nic.cl/domain/ejemplo.cl' }) : resp(200, RDAP_OK)); })() });
+  assert.strictEqual(r.status, 'ok');
+  for (const loc of ['http://169.254.169.254/latest/', 'https://127.0.0.1/x', 'http://rdap.nic.cl/domain/x', 'https://localhost/x']) {
+    r = await intel.lookupRdap('ejemplo.cl', { lookup: pubLookup, fetch: async () => resp(302, '', { location: loc }) });
+    assert.strictEqual(r.status, 'no verificable', loc);
+    assert.ok(/bloqueada|no permitida|no válida/.test(r.error), loc + ' -> ' + r.error);
+  }
+  r = await intel.lookupRdap('ejemplo.cl', { lookup: async () => [{ address: '127.0.0.1', family: 4 }], fetch: async () => resp(302, '', { location: 'https://rdap.trampa.com/x' }) });
+  assert.strictEqual(r.status, 'no verificable', 'dominio que resuelve a loopback');
+});
+test('domain-intel: fallos de los servicios se informan como no verificable (sin inventar)', async () => {
+  const boom = async () => { throw new Error('caído'); };
+  const r = await intel.run('ejemplo.cl', { fetch: boom, resolver: mockResolver({ 'A:ejemplo.cl': ['93.184.216.34'] }), lookup: pubLookup });
+  assert.strictEqual(r.rdap.status, 'no verificable');
+  assert.strictEqual(r.dnssec.status, 'no verificable');
+  assert.strictEqual(r.geo[0].status, 'no verificable');
+  assert.strictEqual(r.findings.length, 0);
+  const nf = await intel.lookupRdap('ejemplo.cl', { fetch: async () => resp(404, '{}') });
+  assert.ok(/no publica datos RDAP|no existe/.test(nf.error));
+  const big = await intel.lookupRdap('ejemplo.cl', { fetch: async () => resp(200, 'x'.repeat(400000)) });
+  assert.strictEqual(big.status, 'no verificable');
+});
+test('domain-intel handler valida método, origen y URL', async () => {
+  rateLimit.reset();
+  assert.strictEqual((await intelH({ httpMethod: 'GET', headers: {} })).statusCode, 405);
+  assert.strictEqual((await intelH(ev({ headers: { host: 'sitio.netlify.app', origin: 'https://otro.com' }, body: '{}' }))).statusCode, 403);
+  assert.strictEqual((await intelH(ev({ body: JSON.stringify({ url: 'http://127.0.0.1' }) }))).statusCode, 400);
+  assert.strictEqual((await intelH(ev({ body: JSON.stringify({ url: 'file:///etc/passwd' }) }))).statusCode, 400);
+});
+test('el PDF incluye la sección de dominio, ubicación y DNSSEC', () => {
+  const r = { reportId: 'NWG-X', appVersion: '1.2.0', analyzedAt: '2026-10-30T12:00:00Z', requestedUrl: 'https://ejemplo.cl/', finalUrl: 'https://ejemplo.cl/', host: 'ejemplo.cl', status: 'completed',
+    https: {}, technologies: [], php: null, headers: [], findings: [], vulnLookups: [], vulnerabilities: [], vulnLookupErrors: [], notPerformed: [], limitations: [], sources: [],
+    domainIntel: { host: 'ejemplo.cl', domain: 'ejemplo.cl', rdap: { status: 'ok', registrar: 'Registrador Ejemplo SpA', registration: '2020-05-01T00:00:00Z', expiration: '2026-11-15T00:00:00Z', daysToExpire: 16, statuses: ['active'], nameservers: ['ns1.ejemplo.cl'] },
+      geo: [{ ip: '93.184.216.34', status: 'ok', country: 'Chile', countryCode: 'CL', region: 'RM', city: 'Santiago', org: 'Proveedor SA', asn: 'AS1234', timezone: 'America/Santiago' }], dnssec: { status: 'no firmado' } } };
+  Core.finalize(r);
+  const mock = new MockJsPDF();
+  Pdf.build(function () { return mock; }, r, Core);
+  const all = mock.calls.texts.join('\n');
+  ['6. Dominio, ubicación y DNSSEC', 'Registrador Ejemplo SpA', 'Santiago', 'No firmado', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+});
+
+/* ---------- Fase 3: subdominios (Certificate Transparency) ---------- */
+const subs = require(path.join(root, 'netlify/lib/subdomains'));
+const subsH = require(path.join(root, 'netlify/functions/subdomains')).handler;
+function ctFetch(over) {
+  const calls = [];
+  const o = over || {};
+  const fetch = async (url) => {
+    calls.push(url);
+    const u = new URL(url);
+    if (u.host === 'api.certspotter.com') return o.cs ? o.cs() : resp(200, [{ dns_names: ['ejemplo.cl', '*.ejemplo.cl', 'www.ejemplo.cl', 'admin.ejemplo.cl', 'blog.ejemplo.cl', 'viejo.ejemplo.cl', 'otro.com'] }]);
+    if (u.host === 'crt.sh') return o.crt ? o.crt() : resp(200, [{ name_value: 'staging.ejemplo.cl\nwww.ejemplo.cl', common_name: 'staging.ejemplo.cl' }, { name_value: 'soporte.ejemplo.cl' }]);
+    throw new Error('host inesperado: ' + u.host);
+  };
+  return { fetch, calls };
+}
+const SUB_DNS = {
+  'A:www.ejemplo.cl': ['93.184.216.34'], 'A:admin.ejemplo.cl': ['93.184.216.35'], 'A:staging.ejemplo.cl': ['10.0.0.9'],
+  'CNAME:blog.ejemplo.cl': ['abandonado.herokuapp.com'], 'CNAME:soporte.ejemplo.cl': ['x.destino-interno.net']
+};
+test('subdominios: parseo de certspotter y crt.sh, comodines, dominios ajenos y duplicados', () => {
+  const c = subs.cleanNames(subs.namesFromCertspotter([{ dns_names: ['*.ejemplo.cl', 'WWW.ejemplo.cl.', 'otro.com', 'x.ejemplo.cl.evil.com'] }]).concat(subs.namesFromCrtsh([{ name_value: 'www.ejemplo.cl\napi.ejemplo.cl', common_name: 'api.ejemplo.cl' }, { name_value: 'bad name.ejemplo.cl' }])), 'ejemplo.cl');
+  assert.deepStrictEqual(c.names.sort(), ['api.ejemplo.cl', 'www.ejemplo.cl']);
+  assert.strictEqual(c.wildcard, true);
+});
+test('subdominios: nombres sensibles, CNAME colgante a servicio de terceros y solo consultas DNS', async () => {
+  const svc = ctFetch();
+  const r = await subs.run('www.ejemplo.cl', { fetch: svc.fetch, resolver: mockResolver(Object.assign({}, SUB_DNS, {
+    'A:blog.ejemplo.cl': dnsErr('ENODATA'), 'AAAA:blog.ejemplo.cl': dnsErr('ENODATA'), 'A:soporte.ejemplo.cl': dnsErr('ENOTFOUND'), 'AAAA:soporte.ejemplo.cl': dnsErr('ENOTFOUND')
+  })), now: () => new Date('2026-10-30T12:00:00Z') });
+  assert.strictEqual(r.status, 'ok');
+  assert.deepStrictEqual(r.ctSources.sort(), ['certspotter', 'crt.sh']);
+  assert.strictEqual(r.total, 6);
+  assert.strictEqual(r.wildcard, true);
+  const by = (n) => r.resolved.find((x) => x.name === n);
+  assert.strictEqual(by('admin.ejemplo.cl').sensitive, true);
+  assert.strictEqual(by('blog.ejemplo.cl').state, 'colgante');
+  assert.strictEqual(by('blog.ejemplo.cl').takeoverProne, true);
+  assert.strictEqual(by('blog.ejemplo.cl').provider, 'Heroku');
+  assert.strictEqual(by('soporte.ejemplo.cl').takeoverProne, false);
+  assert.strictEqual(by('viejo.ejemplo.cl').state, 'no resuelve');
+  assert.ok(by('staging.ejemplo.cl').ips[0].includes('no pública'), 'IP privada marcada');
+  const t = r.findings.map((f) => f.severity + ':' + f.title).join(' | ');
+  assert.ok(/Medio:Posible "subdomain takeover"/.test(t));
+  assert.ok(/Bajo:Subdominios con nombre sensible/.test(t));
+  assert.ok(/Bajo:CNAME hacia destinos que no resuelven/.test(t));
+  assert.ok(/Informativo:6 subdominios aparecen en certificados públicos/.test(t));
+  assert.ok(r.findings.every((f) => /^NWG-S\d{3}$/.test(f.id)));
+  const hosts = svc.calls.map((u) => new URL(u).host);
+  assert.ok(hosts.every((h) => ['api.certspotter.com', 'crt.sh'].includes(h)), 'sin conexiones a los subdominios: ' + hosts);
+});
+test('subdominios: límite de 40 resoluciones, con los nombres sensibles primero', async () => {
+  const many = [];
+  for (let i = 0; i < 120; i++) many.push('host' + String(i).padStart(3, '0') + '.ejemplo.cl');
+  many.push('zz-admin.ejemplo.cl', 'admin.ejemplo.cl');
+  let resolved = 0;
+  const base = mockResolver({});
+  const counting = Object.assign({}, base, { resolve4: async () => { resolved++; throw dnsErr('ENOTFOUND'); } });
+  const svc = ctFetch({ cs: () => resp(200, [{ dns_names: many }]), crt: () => resp(200, []) });
+  const r = await subs.run('ejemplo.cl', { fetch: svc.fetch, resolver: counting });
+  assert.strictEqual(r.total, 122);
+  assert.strictEqual(r.checked, 40);
+  assert.strictEqual(resolved, 40);
+  assert.ok(r.resolved.slice(0, 1).some((x) => x.name === 'admin.ejemplo.cl'), 'sensible primero');
+  assert.ok(r.limitations.some((l) => /solo 40 de 122/.test(l)));
+  assert.strictEqual(r.names.length, 100);
+  assert.strictEqual(r.truncated, true);
+});
+test('subdominios: un servicio caído se tolera; ambos caídos = no verificable; plataforma = no aplica', async () => {
+  let r = await subs.run('ejemplo.cl', { fetch: ctFetch({ crt: () => { throw new Error('timeout'); } }).fetch, resolver: mockResolver({}) });
+  assert.strictEqual(r.status, 'ok');
+  assert.ok(r.limitations.some((l) => /no respondió/.test(l)));
+  const boom = async () => { throw new Error('caído'); };
+  r = await subs.run('ejemplo.cl', { fetch: boom, resolver: mockResolver({}) });
+  assert.strictEqual(r.status, 'no verificable');
+  assert.strictEqual(r.findings.length, 0);
+  const svc = ctFetch();
+  r = await subs.run('mi-sitio.netlify.app', { fetch: svc.fetch, resolver: mockResolver({}) });
+  assert.strictEqual(r.status, 'no aplica');
+  assert.strictEqual(svc.calls.length, 0);
+});
+test('subdominios: respuesta enorme se rechaza sin romper', async () => {
+  const r = await subs.run('ejemplo.cl', { fetch: ctFetch({ cs: () => resp(200, 'x'.repeat(5 * 1024 * 1024)), crt: () => resp(200, 'x'.repeat(5 * 1024 * 1024)) }).fetch, resolver: mockResolver({}) });
+  assert.strictEqual(r.status, 'no verificable');
+});
+test('subdomains handler valida método, origen y URL', async () => {
+  rateLimit.reset();
+  assert.strictEqual((await subsH({ httpMethod: 'GET', headers: {} })).statusCode, 405);
+  assert.strictEqual((await subsH(ev({ headers: { host: 'sitio.netlify.app', origin: 'https://otro.com' }, body: '{}' }))).statusCode, 403);
+  assert.strictEqual((await subsH(ev({ body: JSON.stringify({ url: 'http://169.254.169.254' }) }))).statusCode, 400);
+  assert.strictEqual((await subsH(ev({ body: JSON.stringify({ url: 'ftp://ejemplo.cl' }) }))).statusCode, 400);
+});
+test('el PDF incluye la sección de subdominios', () => {
+  const r = { reportId: 'NWG-X', appVersion: '1.3.0', analyzedAt: '2026-10-30T12:00:00Z', requestedUrl: 'https://ejemplo.cl/', finalUrl: 'https://ejemplo.cl/', host: 'ejemplo.cl', status: 'completed',
+    https: {}, technologies: [], php: null, headers: [], findings: [], vulnLookups: [], vulnerabilities: [], vulnLookupErrors: [], notPerformed: [], limitations: [], sources: [],
+    subdomains: { host: 'ejemplo.cl', domain: 'ejemplo.cl', status: 'ok', ctSources: ['certspotter'], total: 3, checked: 1, wildcard: false, truncated: false, names: ['admin.ejemplo.cl', 'viejo.ejemplo.cl', 'zz.ejemplo.cl'],
+      resolved: [{ name: 'admin.ejemplo.cl', state: 'colgante', cnames: ['x.herokuapp.com'], ips: [], provider: 'Heroku', takeoverProne: true, sensitive: true }] } };
+  Core.finalize(r);
+  const mock = new MockJsPDF();
+  Pdf.build(function () { return mock; }, r, Core);
+  const all = mock.calls.texts.join('\n');
+  ['7. Subdominios (Certificate Transparency)', 'admin.ejemplo.cl', 'takeover', '(Heroku)', 'viejo.ejemplo.cl', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+});
+
+/* ---------- Fase 4: consistencia entre módulos, sin repeticiones ---------- */
+async function fullMergedReport() {
+  const now = () => new Date('2026-10-30T12:00:00Z');
+  const map = Object.assign({}, CF_MAP, SUB_DNS, { 'CNAME:www.ejemplo.cl': ['destino.herokuapp.com'], 'A:blog.ejemplo.cl': dnsErr('ENODATA'), 'AAAA:blog.ejemplo.cl': dnsErr('ENODATA') });
+  const i = await infra.run('www.ejemplo.cl', { resolver: mockResolver(map), now });
+  const d = await intel.run('www.ejemplo.cl', { fetch: fakeServices().fetch, resolver: mockResolver(map), lookup: pubLookup, now });
+  const sb = await subs.run('www.ejemplo.cl', { fetch: ctFetch().fetch, resolver: mockResolver(map), now });
+  const r = { reportId: 'NWG-X', appVersion: '1.4.0', analyzedAt: '2026-10-30T12:00:00Z', requestedUrl: 'https://www.ejemplo.cl/', finalUrl: 'https://www.ejemplo.cl/', host: 'www.ejemplo.cl', status: 'completed',
+    https: { available: 'Sí', certificate: { daysLeft: 60 } }, technologies: [{ name: 'PHP', status: 'Confirmado' }], php: null, headers: [], findings: [], vulnLookups: [], vulnerabilities: [], vulnLookupErrors: [], notPerformed: ['n1'], limitations: ['Base'], sources: [{ title: 'NVD', url: 'https://nvd.nist.gov/x' }] };
+  Core.mergeModule(r, 'infrastructure', i, 'infra falló');
+  Core.mergeModule(r, 'domainIntel', d, 'dominio falló');
+  Core.mergeModule(r, 'subdomains', sb, 'subdominios falló');
+  return Core.finalize(r);
+}
+test('mergeModule: no duplica limitaciones ni fuentes y registra un módulo fallido una sola vez', () => {
+  const r = { findings: [], limitations: ['L1'], sources: [{ url: 'https://a' }] };
+  Core.mergeModule(r, 'infrastructure', { host: 'x.cl', findings: [{ id: 'NWG-I001' }], limitations: ['L1', 'L2', 'L2'], sources: [{ url: 'https://a' }, { url: 'https://b' }] }, 'falló');
+  assert.deepStrictEqual(r.limitations, ['L1', 'L2']);
+  assert.strictEqual(r.sources.length, 2);
+  assert.strictEqual(r.findings.length, 1);
+  Core.mergeModule(r, 'subdomains', { error: 'timeout' }, 'El análisis de subdominios no pudo completarse');
+  Core.mergeModule(r, 'subdomains', { error: 'timeout' }, 'El análisis de subdominios no pudo completarse');
+  assert.strictEqual(r.subdomains, null);
+  assert.strictEqual(r.limitations.filter((l) => /subdominios no pudo/.test(l)).length, 1);
+});
+test('auditoría: informe con todos los módulos sin IDs ni limitaciones repetidas', async () => {
+  const r = await fullMergedReport();
+  const ids = r.findings.map((f) => f.id);
+  assert.strictEqual(new Set(ids).size, ids.length, 'IDs duplicados: ' + ids);
+  assert.strictEqual(new Set(r.limitations).size, r.limitations.length, 'limitaciones repetidas');
+  const urls = r.sources.map((s) => s.url);
+  assert.strictEqual(new Set(urls).size, urls.length, 'fuentes repetidas');
+  const titles = r.findings.map((f) => f.title);
+  assert.strictEqual(new Set(titles).size, titles.length, 'títulos repetidos');
+});
+test('auditoría: sin limitaciones desactualizadas ni contradictorias entre módulos', async () => {
+  const r = await fullMergedReport();
+  const lim = r.limitations.join('\n');
+  assert.ok(!/No se enumeraron subdominios/.test(lim), 'dice que no se enumeraron subdominios aunque sí se hizo');
+  assert.ok(!/no se evaluó DNSSEC/.test(lim), 'dice que no se evaluó DNSSEC aunque sí se hizo');
+  assert.strictEqual(r.limitations.filter((l) => /ubicación de la IP|país mostrado/.test(l)).length, 2, 'cada aviso de ubicación aporta algo distinto');
+  assert.ok(!r.limitations.some((l) => /CDN, proxy o balanceador/.test(l) && /RIR/.test(l)));
+});
+test('auditoría: el CNAME abandonado del propio sitio se informa una sola vez (NWG-I), no también como subdominio', async () => {
+  const r = await fullMergedReport();
+  const take = r.findings.filter((f) => /subdomain takeover/.test(f.title));
+  const own = take.filter((f) => (f.evidence || []).some((e) => /^www\.ejemplo\.cl/.test(e)));
+  assert.strictEqual(own.length, 1, 'el host propio aparece en ' + own.length + ' hallazgos');
+  assert.ok(/^NWG-I/.test(own[0].id));
+});
+test('resumen ejecutivo: máx. 3 prioridades coherentes con los hallazgos y sin datos inventados', async () => {
+  const r = await fullMergedReport();
+  const s = r.summary;
+  assert.strictEqual(s.incomplete, false);
+  assert.ok(s.priorities.length >= 1 && s.priorities.length <= 3);
+  s.priorities.forEach((p, i) => assert.strictEqual(p.id, r.prioritized[i].id));
+  assert.ok(s.priorities.every((p) => p.severity !== 'Informativo'));
+  assert.ok(s.points.some((p) => /^Hallazgos: \d+ en total, \d+ de gravedad Baja o superior/.test(p)));
+  assert.ok(s.points.some((p) => /Tecnologías confirmadas: PHP/.test(p)));
+  assert.ok(!s.points.some((p) => /CVE/.test(p)), 'sin CVE no debe mencionarlos');
+});
+test('resumen ejecutivo: análisis incompleto o módulo caído se declara, sin porcentajes', () => {
+  const f = Core.finalize({ status: 'failed', error: 'dns', findings: [], vulnerabilities: [], limitations: [] });
+  assert.strictEqual(f.summary.incomplete, true);
+  assert.ok(f.summary.headline.includes('Evaluación incompleta'));
+  const r = Core.finalize({ status: 'completed', finalUrl: 'https://x.cl/', findings: [], vulnerabilities: [], limitations: [], infrastructure: null, subdomains: null });
+  assert.ok(r.summary.points.some((p) => /infraestructura y DNS, subdominios/.test(p)));
+  assert.ok(!/%/.test(JSON.stringify(r.summary)));
+});
+test('el PDF incluye el resumen ejecutivo y no repite la fuente de hallazgos consecutivos', async () => {
+  const r = await fullMergedReport();
+  const mock = new MockJsPDF();
+  Pdf.build(function () { return mock; }, r, Core);
+  const all = mock.calls.texts.join('\n');
+  assert.ok(all.includes('Resumen ejecutivo:'));
+  assert.ok(all.includes('Prioridades (detalle en la sección 10):'));
+  const lines = mock.calls.texts.filter((t) => /^Fuente: /.test(t));
+  lines.forEach((t, i) => { if (i) assert.notStrictEqual(t, lines[i - 1], 'fuente repetida seguida'); });
+});
+
 /* ---------- ejecución ---------- */
 (async () => {
   for (const t of queue) {

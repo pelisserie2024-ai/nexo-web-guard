@@ -114,6 +114,9 @@
           <li>No hay cuentas, inicio de sesión ni base de datos. Los resultados permanecen en la memoria de esta pestaña y se pierden al cerrarla o limpiar los resultados.</li>
           <li>La dirección que analizas se envía a una función serverless de Netlify, que realiza las solicitudes al sitio. La herramienta no guarda ni registra esa dirección.</li>
           <li>Para buscar vulnerabilidades se envía a la API pública de NVD (NIST) únicamente el <strong>nombre y la versión</strong> del componente, nunca tu dirección.</li>
+          <li>El análisis de infraestructura usa consultas DNS públicas hechas desde el servidor de análisis. La información de red (ASN y país de registro de las IP) se consulta en el servicio DNS público de Team Cymru, al que solo se envía la dirección IP. No se envía tu dirección web completa.</li>
+          <li>El análisis de dominio usa servicios públicos: el <strong>dominio</strong> se envía a rdap.org (que redirige al registro oficial) y a Google Public DNS (DNSSEC); las <strong>IP públicas</strong> del sitio se envían a ipwho.is para estimar su ubicación. No se envían rutas ni datos tuyos, y no se muestran datos personales del titular del dominio.</li>
+          <li>Para listar subdominios se consultan los registros públicos de certificados (Cert Spotter y crt.sh), que reciben el <strong>dominio</strong>. Los subdominios encontrados solo se consultan por DNS; no se conecta a ellos.</li>
           <li>El PDF y el JSON se generan en tu dispositivo y no se envían a ningún tercero.</li>
         </ul>
       </div>
@@ -123,7 +126,7 @@
   <footer class="site-footer">
     <div class="wrap footer-row">
       <span><img src="assets/logo.svg" alt="" width="20" height="20"> NEXO WEB GUARD</span>
-      <span>Versión <span id="app-version">1.0.0</span> · Análisis defensivo y no intrusivo</span>
+      <span>Versión <span id="app-version">1.4.0</span> · Análisis defensivo y no intrusivo</span>
     </div>
   </footer>
 

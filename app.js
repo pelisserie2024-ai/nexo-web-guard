@@ -110,11 +110,42 @@
     setSteps([
       'Validando la dirección',
       'Comprobaciones en el servidor (HTTP, HTTPS, certificado y tecnologías)',
+      'Infraestructura y DNS (IP, proveedor, correo)',
+      'Dominio, ubicación aproximada y DNSSEC',
+      'Subdominios (certificados públicos) y CNAME colgantes',
       'Consulta de vulnerabilidades en NVD',
       'Preparando los resultados'
     ]);
     stepState(0, 'done');
     stepState(1, 'running');
+    stepState(2, 'running');
+    stepState(3, 'running');
+    stepState(4, 'running');
+
+    // El análisis de infraestructura (solo DNS) corre en paralelo con el del servidor.
+    var infraP = callApi('infrastructure', { url: v.url }, 15000).then(function (r) {
+      stepState(2, r.available === false ? 'error' : 'done', r.available === false ? 'Infraestructura y DNS: no se pudo completar' : null);
+      return r;
+    }).catch(function (e) {
+      stepState(2, 'error', 'Infraestructura y DNS: ' + e.message);
+      return { error: e.message };
+    });
+
+    var domainP = callApi('domain-intel', { url: v.url }, 20000).then(function (r) {
+      stepState(3, 'done');
+      return r;
+    }).catch(function (e) {
+      stepState(3, 'error', 'Dominio, ubicación y DNSSEC: ' + e.message);
+      return { error: e.message };
+    });
+
+    var subsP = callApi('subdomains', { url: v.url }, 20000).then(function (r) {
+      stepState(4, r.status === 'no verificable' ? 'error' : 'done', r.status === 'no verificable' ? 'Subdominios: no verificable (servicio de certificados no disponible)' : null);
+      return r;
+    }).catch(function (e) {
+      stepState(4, 'error', 'Subdominios: ' + e.message);
+      return { error: e.message };
+    });
 
     var result;
     callApi('analyze-site', { url: v.url, authorized: true }, 28000).then(function (res) {
@@ -122,15 +153,15 @@
       stepState(1, res.status === 'failed' ? 'error' : 'done', res.status === 'failed' ? 'Comprobaciones en el servidor: no se pudo completar' : null);
       var lookups = (res.status === 'completed' && res.vulnLookups) ? res.vulnLookups : [];
       if (!lookups.length) {
-        stepState(2, 'done', res.status === 'completed' ? 'Consulta de vulnerabilidades: sin versiones verificables que consultar' : 'Consulta de vulnerabilidades: omitida');
+        stepState(5, 'done', res.status === 'completed' ? 'Consulta de vulnerabilidades: sin versiones verificables que consultar' : 'Consulta de vulnerabilidades: omitida');
         return;
       }
       var i = 0;
       result.vulnLookupSummary = {};
       function next() {
-        if (i >= lookups.length) { stepState(2, 'done', 'Consulta de vulnerabilidades en NVD (' + lookups.length + ' de ' + lookups.length + ')'); return Promise.resolve(); }
+        if (i >= lookups.length) { stepState(5, 'done', 'Consulta de vulnerabilidades en NVD (' + lookups.length + ' de ' + lookups.length + ')'); return Promise.resolve(); }
         var lk = lookups[i];
-        stepState(2, 'running', 'Consultando NVD: ' + lk.component + ' ' + lk.version + ' (' + (i + 1) + ' de ' + lookups.length + ')');
+        stepState(5, 'running', 'Consultando NVD: ' + lk.component + ' ' + lk.version + ' (' + (i + 1) + ' de ' + lookups.length + ')');
         return callApi('vulnerability-lookup', { product: lk.product, version: lk.version }, 12000).then(function (r) {
           var items = Core.normalizeVulns(lk, r);
           result.vulnerabilities = result.vulnerabilities.concat(items);
@@ -141,12 +172,17 @@
       }
       return next();
     }).then(function () {
-      stepState(3, 'running');
+      return Promise.all([infraP, domainP, subsP]);
+    }).then(function (both) {
+      stepState(6, 'running');
+      mergeInfra(result, both[0]);
+      mergeDomain(result, both[1]);
+      mergeSubs(result, both[2]);
       Core.finalize(result);
       state.result = result;
       renderResults(result);
-      stepState(3, 'done');
-      if (result.vulnLookupErrors.length) stepState(2, 'error', 'Consulta de vulnerabilidades: algunas consultas no pudieron completarse');
+      stepState(6, 'done');
+      if (result.vulnLookupErrors.length) stepState(5, 'error', 'Consulta de vulnerabilidades: algunas consultas no pudieron completarse');
     }).catch(function (e) {
       var idx = steps.findIndex(function (s) { return s.li.className === 'running'; });
       if (idx >= 0) stepState(idx, 'error');
@@ -155,6 +191,148 @@
       state.running = false;
       scanBtn.disabled = false;
     });
+  }
+
+  /* Fusiona los módulos adicionales con una única función (Core.mergeModule): sin duplicar limitaciones ni fuentes. */
+  function mergeInfra(result, d) { Core.mergeModule(result, 'infrastructure', d, 'El análisis de infraestructura y DNS no pudo completarse'); }
+  function mergeDomain(result, d) { Core.mergeModule(result, 'domainIntel', d, 'El análisis de dominio, ubicación y DNSSEC no pudo completarse'); }
+  function mergeSubs(result, d) { Core.mergeModule(result, 'subdomains', d, 'El análisis de subdominios no pudo completarse'); }
+
+  function subdomainsSection(sd) {
+    var s = section('Subdominios (Certificate Transparency)', 'Subdominios que figuran en certificados públicos. Solo se hicieron consultas DNS; no se conectó a ninguno por HTTP.');
+    if (!sd) { s.appendChild(h('p', { class: 'muted', text: 'No disponible: este análisis no pudo completarse. Repite el análisis.' })); return s; }
+    if (sd.status !== 'ok') {
+      s.appendChild(h('p', { class: sd.status === 'no verificable' ? 'banner' : 'muted', text: sd.note || 'No verificable con las comprobaciones disponibles.' }));
+      return s;
+    }
+    s.appendChild(kv([
+      ['Dominio base (estimado)', sd.domain],
+      ['Fuentes consultadas', (sd.ctSources || []).join(', ') || 'n/d'],
+      ['Subdominios encontrados', String(sd.total) + (sd.wildcard ? ' (existe un certificado comodín *.' + sd.domain + ')' : '')],
+      ['Resueltos por DNS', sd.checked + ' de ' + sd.total]
+    ]));
+    if ((sd.resolved || []).length) {
+      s.appendChild(table(['Subdominio', 'Estado', 'Destino', 'Notas'], sd.resolved.map(function (r) {
+        var notes = [];
+        if (r.sensitive) notes.push('nombre sensible');
+        if (r.takeoverProne && r.state === 'colgante') notes.push('posible takeover (' + r.provider + ')');
+        else if (r.provider) notes.push(r.provider);
+        var badgeCls = r.state === 'resuelve' ? 'st-confirmado' : (r.state === 'colgante' ? 'sev-medio' : 'st-desconocido');
+        return [r.name, h('span', { class: 'badge ' + badgeCls, text: r.state }),
+          (r.cnames.length ? 'CNAME ' + r.cnames[0] + (r.ips.length ? ' → ' : '') : '') + (r.ips.slice(0, 2).join(', ') || (r.cnames.length ? '' : '—')),
+          notes.join(' · ') || '—'];
+      })));
+    }
+    var rest = (sd.names || []).filter(function (n) { return !(sd.resolved || []).some(function (r) { return r.name === n; }); });
+    if (rest.length) {
+      var d = h('details', {}, h('summary', { text: 'Otros subdominios sin resolver (' + rest.length + (sd.truncated ? '+' : '') + ')' }), list(rest.slice(0, 100)));
+      s.appendChild(d);
+    }
+    s.appendChild(h('p', { class: 'muted small', text: 'La lista procede de registros públicos de certificados: puede ser incompleta o incluir nombres que ya no existen.' }));
+    return s;
+  }
+
+  function fmtDay(iso) {
+    var d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso || 'No disponible') : d.toLocaleDateString('es-CL', { dateStyle: 'long', timeZone: 'UTC' });
+  }
+
+  function domainSection(di) {
+    var s = section('Dominio, ubicación y DNSSEC', 'Datos públicos del dominio (RDAP), ubicación aproximada de las IP y estado de DNSSEC. No se muestran datos personales del titular.');
+    if (!di) { s.appendChild(h('p', { class: 'muted', text: 'No disponible: este análisis no pudo completarse. Repite el análisis.' })); return s; }
+
+    s.appendChild(h('h4', { text: 'Datos del dominio (RDAP)' }));
+    var rd = di.rdap || {};
+    if (rd.status === 'ok') {
+      s.appendChild(kv([
+        ['Dominio', di.domain],
+        ['Registrador', rd.registrar || 'No publicado'],
+        ['Fecha de registro', rd.registration ? fmtDay(rd.registration) + (typeof rd.ageDays === 'number' ? ' (hace ' + rd.ageDays + ' días)' : '') : 'No publicada'],
+        ['Fecha de expiración', rd.expiration ? fmtDay(rd.expiration) + (typeof rd.daysToExpire === 'number' ? ' (' + (rd.daysToExpire >= 0 ? 'en ' + rd.daysToExpire + ' días' : 'vencido') + ')' : '') : 'No publicada'],
+        ['Última modificación', rd.lastChanged ? fmtDay(rd.lastChanged) : 'No publicada'],
+        ['Estados', (rd.statuses || []).join(', ') || 'No publicados'],
+        ['Servidores de nombres (RDAP)', (rd.nameservers || []).join(', ') || 'No publicados']
+      ]));
+    } else {
+      s.appendChild(h('p', { class: 'muted', text: rd.note || rd.error || 'No verificable con las comprobaciones disponibles.' }));
+    }
+
+    s.appendChild(h('h4', { text: 'Ubicación aproximada de las IP' }));
+    var okGeo = (di.geo || []).filter(function (g) { return g.status === 'ok'; });
+    if (okGeo.length) {
+      s.appendChild(table(['IP', 'País', 'Región / ciudad', 'Organización', 'Zona horaria'], okGeo.map(function (g) {
+        return [g.ip, (g.country || 'n/d') + (g.countryCode ? ' (' + g.countryCode + ')' : ''), [g.region, g.city].filter(Boolean).join(' / ') || 'n/d', (g.org || 'n/d') + (g.asn ? ' · ' + g.asn : ''), g.timezone || 'n/d'];
+      })));
+    } else {
+      s.appendChild(h('p', { class: 'muted', text: (di.geo || []).length ? 'No verificable con las comprobaciones disponibles.' : 'No hay IP públicas que consultar.' }));
+    }
+    s.appendChild(h('p', { class: 'muted small', text: 'Ubicación aproximada: puede ser incorrecta. Con un CDN o proxy corresponde al proveedor, no al servidor de origen.' }));
+
+    s.appendChild(h('h4', { text: 'DNSSEC' }));
+    var dk = di.dnssec || {};
+    var dkText = dk.status === 'firmado' ? 'Firmado (' + dk.dsRecords + ' registro(s) DS)' + (dk.validated ? ' y validado por el resolvedor.' : '; el resolvedor no confirmó la validación.')
+      : (dk.status === 'no firmado' ? 'No firmado: no hay registros DS publicados.' : (dk.note || dk.error || 'No verificable con las comprobaciones disponibles.'));
+    s.appendChild(h('p', { text: dkText }));
+    return s;
+  }
+
+  function assessBadge(text) {
+    var cls = 'st-probable';
+    if (text === 'Correcto' || text === 'Aceptable') cls = 'st-confirmado';
+    else if (text === 'Inseguro') cls = 'sev-medio';
+    return h('span', { class: 'badge ' + cls, text: text });
+  }
+
+  function infraSection(inf) {
+    var s = section('Infraestructura y DNS', 'Datos obtenidos de DNS público, sin conectarse al sitio. Cada dato indica sus límites.');
+    if (!inf) { s.appendChild(h('p', { class: 'muted', text: 'No disponible: el análisis de infraestructura no pudo completarse. Repite el análisis.' })); return s; }
+    s.appendChild(kv([['Dominio analizado', inf.host], ['Dominio base (estimado)', inf.domain]]));
+    if (inf.available === false || inf.noRecords) {
+      s.appendChild(h('p', { class: 'banner', text: (inf.limitations && inf.limitations[0]) || 'No se pudo completar la consulta DNS.' }));
+      return s;
+    }
+
+    s.appendChild(h('h4', { text: 'Direcciones IP y red' }));
+    if ((inf.ips || []).length) {
+      s.appendChild(table(['IP', 'DNS inverso', 'Red (ASN)', 'País de registro'], inf.ips.map(function (i) {
+        return [i.ip + (i.public ? '' : ' (no pública)'), (i.ptr || []).join(', ') || '—',
+          i.asn ? i.asn + (i.asName ? ' · ' + i.asName : '') + (i.prefix ? ' · ' + i.prefix : '') : 'No verificable',
+          i.country ? i.country + (i.registry ? ' (' + i.registry.toUpperCase() + ')' : '') : 'No verificable'];
+      })));
+      s.appendChild(h('p', { class: 'muted small', text: 'El país es el de registro del bloque IP, no la ubicación física del servidor. Con un CDN o proxy, la IP no es la del servidor de origen.' }));
+    } else {
+      s.appendChild(h('p', { class: 'muted', text: 'No se obtuvieron direcciones IP para este nombre.' }));
+    }
+
+    s.appendChild(h('h4', { text: 'Proveedores detectados' }));
+    if ((inf.hosting || []).length) {
+      s.appendChild(table(['Proveedor', 'Función', 'Confianza', 'Evidencia'], inf.hosting.map(function (x) {
+        return [x.name, x.role, x.confidence, x.evidence.join(' · ')];
+      })));
+    } else {
+      s.appendChild(h('p', { class: 'muted', text: 'Sin proveedor identificable con los datos DNS (no significa que no exista uno).' }));
+    }
+
+    s.appendChild(h('h4', { text: 'Registros DNS' }));
+    var order = ['A', 'AAAA', 'CNAME', 'NS', 'MX', 'TXT', 'CAA'];
+    s.appendChild(table(['Tipo', 'Estado', 'Valores'], order.map(function (k) {
+      var r = inf.records[k] || { status: 'no verificable', values: [] };
+      var shown = r.values.length ? r.values.map(function (v) { return String(v).slice(0, 200); }).join(' · ') : '—';
+      return [k, r.status, shown];
+    })));
+
+    s.appendChild(h('h4', { text: 'Seguridad del correo (SPF, DMARC)' }));
+    var em = inf.email;
+    if (em) {
+      s.appendChild(kv([
+        ['Dominio evaluado', em.domain],
+        ['Recibe correo (MX)', em.receivesMail === null ? 'No verificable con las comprobaciones disponibles' : (em.receivesMail ? 'Sí' : 'No')],
+        ['SPF', em.spf ? h('span', {}, assessBadge(em.spf.assessment), ' ', em.spf.note, em.spf.value ? h('div', { class: 'muted small', text: em.spf.value }) : null) : 'No verificable con las comprobaciones disponibles'],
+        ['DMARC', em.dmarc ? h('span', {}, assessBadge(em.dmarc.assessment), ' ', em.dmarc.note, em.dmarc.value ? h('div', { class: 'muted small', text: em.dmarc.value }) : null) : 'No verificable con las comprobaciones disponibles'],
+        ['DKIM', em.dkim]
+      ]));
+    }
+    return s;
   }
 
   /* ---------- renderizado de resultados ---------- */
@@ -236,6 +414,21 @@
     head.appendChild(actions);
     resultsBox.appendChild(head);
 
+    // Resumen ejecutivo (solo datos ya presentes en el resultado)
+    if (r.summary && !r.summary.incomplete) {
+      var sSum = section('Resumen ejecutivo');
+      sSum.appendChild(list(r.summary.points));
+      if (r.summary.priorities.length) {
+        sSum.appendChild(h('h4', { text: 'Prioridades (detalle y recomendaciones más abajo)' }));
+        sSum.appendChild(h('ol', {}, r.summary.priorities.map(function (p) {
+          return h('li', {}, sevBadge(p.severity), ' ' + p.title + ' ', h('span', { class: 'muted small', text: '(' + p.id + ')' }));
+        })));
+      } else {
+        sSum.appendChild(h('p', { class: 'muted', text: 'No hay hallazgos de gravedad Baja o superior en las comprobaciones realizadas.' }));
+      }
+      resultsBox.appendChild(sSum);
+    }
+
     // HTTPS
     var hs = r.https || {};
     var cert = hs.certificate;
@@ -281,6 +474,10 @@
       sPhp.appendChild(h('p', { class: 'muted', text: 'No disponible: no se obtuvo respuesta analizable del sitio.' }));
     }
     resultsBox.appendChild(sPhp);
+
+    resultsBox.appendChild(infraSection(r.infrastructure));
+    resultsBox.appendChild(domainSection(r.domainIntel));
+    resultsBox.appendChild(subdomainsSection(r.subdomains));
 
     // Cabeceras
     var sHead = section('Cabeceras de seguridad', 'La ausencia de una cabecera no equivale automáticamente a una vulnerabilidad: depende del contexto.');
