@@ -5,7 +5,7 @@ Análisis defensivo y no intrusivo de seguridad web. Frontend estático + 3 Netl
 ## Estructura
 ```
 index.html  styles.css  app.js  netlify.toml  package.json
-js/core.js  js/pdf-report.js        (lógica de riesgo y generador PDF)
+js/core.js  js/advisor.js  js/pdf-report.js   (lógica de riesgo, asesor de reporte/mejoras y generador PDF)
 vendor/jspdf.umd.min.js             (se genera con "npm run build")
 netlify/functions/  analyze-site.js  security-headers.js  vulnerability-lookup.js  infrastructure.js  domain-intel.js  subdomains.js
 netlify/lib/        (SSRF, fetch seguro, detección, cabeceras, PHP, NVD, robots)
@@ -62,6 +62,10 @@ Usa servicios públicos externos (se informa en la sección de Privacidad de la 
 - **Resumen ejecutivo** al inicio de los resultados y del PDF: puntos clave y las 3 prioridades, calculados solo con datos del análisis (sin porcentajes).
 - **Sin repeticiones:** los módulos se fusionan con una única función (`Core.mergeModule`), que no duplica limitaciones ni fuentes. El CNAME abandonado del propio sitio se informa una sola vez, y se corrigió una limitación desactualizada.
 - **Auditoría automática:** pruebas que combinan todos los módulos y comprueban IDs, limitaciones y fuentes sin repetir.
+
+## Reportar y mejorar (v1.5, Fase 5)
+- **«Reportar un sitio sospechoso»:** si el análisis identificó un proveedor de hosting/CDN (Cloudflare, AWS, Netlify, etc.) o un registrador (RDAP), muestra el enlace oficial de reporte de abuso de ese proveedor, más canales generales (Google Safe Browsing, PDI Chile, ICANN Lookup). Es una lista fija de enlaces conocidos: si el proveedor detectado no está en la lista, se indica explícitamente en vez de inventar un enlace. NEXO WEB GUARD no presenta denuncias ni actúa sobre el sitio.
+- **«Qué mejorar»:** las recomendaciones priorizadas ahora incluyen una dificultad orientativa («Fácil», «Depende del proveedor», «Requiere coordinación», etc.) según la categoría del hallazgo, para ayudar a decidir por dónde empezar. Es una referencia general, no un instructivo paso a paso.
 
 ## Seguridad y límites
 - Solo HTTP/HTTPS, puertos 80/443. Se bloquean localhost, IP privadas/link-local/IPv6 internas, nombres internos y redirecciones hacia ellos; DNS resuelto una vez y conexión fijada a esa IP (anti-rebinding).

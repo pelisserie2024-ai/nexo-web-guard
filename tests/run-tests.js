@@ -19,6 +19,7 @@ const { runAnalysis } = require(path.join(root, 'netlify/lib/analysis'));
 const safeFetch = require(path.join(root, 'netlify/lib/safe-fetch'));
 const rateLimit = require(path.join(root, 'netlify/lib/rate-limit'));
 const Core = require(path.join(root, 'js/core'));
+const Advisor = require(path.join(root, 'js/advisor'));
 const Pdf = require(path.join(root, 'js/pdf-report'));
 
 let passed = 0;
@@ -639,7 +640,7 @@ test('el PDF incluye la sección de infraestructura con datos reales', () => {
   const mock = new MockJsPDF();
   Pdf.build(function () { return mock; }, r, Core);
   const all = mock.calls.texts.join('\n');
-  ['5. Infraestructura y DNS', 'AS13335', 'CLOUDFLARENET', 'Cloudflare', 'No verificable con las comprobaciones disponibles', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+  ['5. Infraestructura y DNS', 'AS13335', 'CLOUDFLARENET', 'Cloudflare', 'No verificable con las comprobaciones disponibles', '15. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
 });
 test('análisis: el mensaje de PHP no se duplica cuando no se detecta', async () => {
   const fetchFollow = stubFetch({
@@ -767,7 +768,7 @@ test('el PDF incluye la sección de dominio, ubicación y DNSSEC', () => {
   const mock = new MockJsPDF();
   Pdf.build(function () { return mock; }, r, Core);
   const all = mock.calls.texts.join('\n');
-  ['6. Dominio, ubicación y DNSSEC', 'Registrador Ejemplo SpA', 'Santiago', 'No firmado', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+  ['6. Dominio, ubicación y DNSSEC', 'Registrador Ejemplo SpA', 'Santiago', 'No firmado', '15. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
 });
 
 /* ---------- Fase 3: subdominios (Certificate Transparency) ---------- */
@@ -870,7 +871,7 @@ test('el PDF incluye la sección de subdominios', () => {
   const mock = new MockJsPDF();
   Pdf.build(function () { return mock; }, r, Core);
   const all = mock.calls.texts.join('\n');
-  ['7. Subdominios (Certificate Transparency)', 'admin.ejemplo.cl', 'takeover', '(Heroku)', 'viejo.ejemplo.cl', '14. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+  ['7. Subdominios (Certificate Transparency)', 'admin.ejemplo.cl', 'takeover', '(Heroku)', 'viejo.ejemplo.cl', '15. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
 });
 
 /* ---------- Fase 4: consistencia entre módulos, sin repeticiones ---------- */
@@ -951,6 +952,55 @@ test('el PDF incluye el resumen ejecutivo y no repite la fuente de hallazgos con
   assert.ok(all.includes('Prioridades (detalle en la sección 10):'));
   const lines = mock.calls.texts.filter((t) => /^Fuente: /.test(t));
   lines.forEach((t, i) => { if (i) assert.notStrictEqual(t, lines[i - 1], 'fuente repetida seguida'); });
+});
+
+/* ---------- Fase 5: asesor (reportar y qué mejorar) ---------- */
+test('buildReportAdvice: usa el proveedor y registrador ya detectados, sin inventar enlaces', () => {
+  const r = { infrastructure: { hosting: [{ name: 'Cloudflare', role: 'CDN / protección' }, { name: 'Cloudflare', role: 'Proveedor de DNS' }, { name: 'Un Proveedor Rarísimo SA', role: 'Alojamiento' }] },
+    domainIntel: { rdap: { status: 'ok', registrar: 'Registrador Ejemplo SpA' } } };
+  const a = Advisor.buildReportAdvice(r);
+  assert.strictEqual(a.providers.length, 2, 'no duplica Cloudflare, agrega el desconocido');
+  assert.strictEqual(a.providers[0].abuseUrl, 'https://abuse.cloudflare.com/');
+  assert.strictEqual(a.providers[1].abuseUrl, null, 'proveedor sin enlace fijo no inventa URL');
+  assert.strictEqual(a.registrar, 'Registrador Ejemplo SpA');
+  assert.ok(a.resources.length >= 3);
+});
+test('buildReportAdvice: sin proveedor ni RDAP, lo declara en vez de inventar', () => {
+  const a = Advisor.buildReportAdvice({ infrastructure: null, domainIntel: { rdap: { status: 'no verificable' } } });
+  assert.strictEqual(a.providers.length, 0);
+  assert.strictEqual(a.registrar, null);
+  assert.ok(/No se pudo determinar/.test(a.registrarNote));
+});
+test('buildImprovementPlan: mismo orden que los hallazgos priorizados, con dificultad por categoría', () => {
+  const r = { findings: [
+    { id: 'NWG-F001', category: 'Cabeceras', title: 'x', severity: 'Medio', confidence: 'Alta' },
+    { id: 'NWG-F002', category: 'PHP', title: 'y', severity: 'Alto', confidence: 'Media' },
+    { id: 'NWG-F003', category: 'Desconocida', title: 'z', severity: 'Bajo', confidence: 'Alta' },
+    { id: 'NWG-F004', category: 'Cabeceras', title: 'w', severity: 'Informativo', confidence: 'Alta' }
+  ] };
+  const plan = Advisor.buildImprovementPlan(r, Core);
+  assert.strictEqual(plan.count, 3, 'excluye Informativo');
+  assert.deepStrictEqual(plan.items.map((i) => i.id), ['NWG-F002', 'NWG-F001', 'NWG-F003'], 'ordenado por gravedad efectiva');
+  assert.strictEqual(plan.items[1].difficulty, 'Fácil');
+  assert.strictEqual(plan.items[2].difficulty, 'Por evaluar', 'categoría sin mapeo no inventa una dificultad');
+});
+test('el PDF incluye "Dónde reportar" con el proveedor y sin romper la numeración', () => {
+  const r = { reportId: 'NWG-X', appVersion: '1.5.0', analyzedAt: '2026-10-31T12:00:00Z', requestedUrl: 'https://ejemplo.cl/', finalUrl: 'https://ejemplo.cl/', host: 'ejemplo.cl', status: 'completed',
+    https: {}, technologies: [], php: null, headers: [], findings: [{ id: 'NWG-F001', category: 'Cabeceras', title: 'Falta CSP', severity: 'Medio', confidence: 'Alta', recommendation: 'r' }],
+    vulnLookups: [], vulnerabilities: [], vulnLookupErrors: [], notPerformed: [], limitations: [], sources: [] };
+  Core.finalize(r);
+  r.reportAdvice = Advisor.buildReportAdvice({ infrastructure: { hosting: [{ name: 'Cloudflare', role: 'CDN / protección' }] }, domainIntel: null });
+  r.improvementPlan = Advisor.buildImprovementPlan(r, Core);
+  const mock = new MockJsPDF();
+  Pdf.build(function () { return mock; }, r, Core);
+  const all = mock.calls.texts.join('\n');
+  ['11. Dónde reportar un sitio sospechoso', 'Cloudflare', 'Para resolver: Fácil', '12. Comprobaciones no realizadas', '15. Aviso importante'].forEach((x) => assert.ok(all.includes(x), 'falta: ' + x));
+  assert.ok(mock.calls.links.includes('https://abuse.cloudflare.com/'));
+});
+test('index.html carga js/advisor.js antes de app.js', () => {
+  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  assert.ok(/js\/advisor\.js/.test(html));
+  assert.ok(html.indexOf('js/advisor.js') < html.indexOf('app.js'));
 });
 
 /* ---------- ejecución ---------- */

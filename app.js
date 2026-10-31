@@ -3,6 +3,7 @@
   'use strict';
 
   var Core = window.NWGCore;
+  var Advisor = window.NWGAdvisor;
   var API = '/.netlify/functions/';
   var state = { result: null, running: false, lastUrl: '' };
 
@@ -179,6 +180,8 @@
       mergeDomain(result, both[1]);
       mergeSubs(result, both[2]);
       Core.finalize(result);
+      result.reportAdvice = Advisor.buildReportAdvice(result);
+      result.improvementPlan = Advisor.buildImprovementPlan(result, Core);
       state.result = result;
       renderResults(result);
       stepState(6, 'done');
@@ -276,6 +279,28 @@
     return s;
   }
 
+  /* Dónde reportar un sitio sospechoso: usa el proveedor de hosting/CDN y el registrador ya detectados. No se consulta nada nuevo. */
+  function reportSection(ra) {
+    var s = section('Reportar un sitio sospechoso', 'Si crees que este sitio es una estafa o phishing, repórtalo a quien puede darlo de baja. NEXO WEB GUARD no interviene sobre el sitio: solo te indica dónde avisar.');
+    if (!ra) { s.appendChild(h('p', { class: 'muted', text: 'No disponible: repite el análisis.' })); return s; }
+    s.appendChild(h('h4', { text: 'Proveedor detectado' }));
+    if (ra.providers.length) {
+      s.appendChild(table(['Proveedor', 'Función', 'Reporte de abuso'], ra.providers.map(function (p) {
+        return [p.name, p.role, p.abuseUrl ? h('a', { href: p.abuseUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Formulario de abuso' }) : 'No hay un enlace fijo registrado para este proveedor'];
+      })));
+    } else {
+      s.appendChild(h('p', { class: 'muted', text: 'No se identificó un proveedor de hosting o CDN en este análisis.' }));
+    }
+    s.appendChild(h('h4', { text: 'Registrador del dominio' }));
+    s.appendChild(h('p', { text: (ra.registrar || 'No disponible') + '. ' + ra.registrarNote }));
+    s.appendChild(h('h4', { text: 'Otros canales' }));
+    var ul = h('ul');
+    ra.resources.forEach(function (x) { ul.appendChild(h('li', {}, h('a', { href: x.url, target: '_blank', rel: 'noopener noreferrer', text: x.title }))); });
+    s.appendChild(ul);
+    s.appendChild(h('p', { class: 'muted small', text: 'NEXO WEB GUARD no realiza denuncias ni ataques contra el sitio: estos son solo enlaces a los canales oficiales de cada proveedor.' }));
+    return s;
+  }
+
   function assessBadge(text) {
     var cls = 'st-probable';
     if (text === 'Correcto' || text === 'Aceptable') cls = 'st-confirmado';
@@ -355,9 +380,11 @@
       h('tbody', {}, rows.map(function (r) { return h('tr', {}, r.map(function (c) { return h('td', {}, c); })); }))));
   }
 
-  function findingCard(f) {
+  function findingCard(f, difficulty) {
     return h('article', { class: 'finding sev-' + slug(f.severity) },
-      h('div', { class: 'tags' }, sevBadge(f.severity), h('span', { class: 'badge neutral', text: 'Confianza: ' + (f.confidence || 'n/d') }), h('span', { class: 'muted small', text: f.category + ' · ' + f.id })),
+      h('div', { class: 'tags' }, sevBadge(f.severity), h('span', { class: 'badge neutral', text: 'Confianza: ' + (f.confidence || 'n/d') }),
+        difficulty ? h('span', { class: 'badge neutral', text: 'Para resolver: ' + difficulty }) : null,
+        h('span', { class: 'muted small', text: f.category + ' · ' + f.id })),
       h('h4', { text: f.title }),
       f.description ? h('p', { text: f.description }) : null,
       f.evidence && f.evidence.length ? [h('strong', { class: 'small', text: 'Evidencia' }), list(f.evidence)] : null,
@@ -512,9 +539,11 @@
     (r.vulnerabilities || []).forEach(function (v) { sVuln.appendChild(vulnCard(v)); });
     resultsBox.appendChild(sVuln);
 
-    // Recomendaciones priorizadas
-    var sRec = section('Recomendaciones priorizadas', 'Ordenadas por gravedad efectiva y confianza.');
-    if ((r.prioritized || []).length) r.prioritized.forEach(function (f) { sRec.appendChild(findingCard(f)); });
+    // Recomendaciones priorizadas (con dificultad orientativa para resolver cada una)
+    var diffById = {};
+    ((r.improvementPlan && r.improvementPlan.items) || []).forEach(function (it) { diffById[it.id] = it.difficulty; });
+    var sRec = section('Recomendaciones priorizadas', 'Ordenadas por gravedad efectiva y confianza. «Para resolver» es una referencia general, no una instrucción paso a paso.');
+    if ((r.prioritized || []).length) r.prioritized.forEach(function (f) { sRec.appendChild(findingCard(f, diffById[f.id])); });
     else sRec.appendChild(h('p', { class: 'muted', text: 'No se registraron hallazgos de gravedad superior a «Informativo» en las comprobaciones realizadas.' }));
     var info = (r.findings || []).filter(function (f) { return f.severity === 'Informativo'; });
     if (info.length) {
@@ -523,6 +552,9 @@
       sRec.appendChild(d);
     }
     resultsBox.appendChild(sRec);
+
+    // Reportar un sitio sospechoso (datos ya detectados: proveedor de hosting/CDN y registrador; sin consultas nuevas)
+    resultsBox.appendChild(reportSection(r.reportAdvice));
 
     // Limitaciones
     var sLim = section('Limitaciones y comprobaciones no realizadas');

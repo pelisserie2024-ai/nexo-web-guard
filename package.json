@@ -1,6 +1,6 @@
 {
   "name": "nexo-web-guard",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "NEXO WEB GUARD - análisis defensivo y no intrusivo de seguridad web",
   "scripts": {

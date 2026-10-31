@@ -11,7 +11,7 @@ const { detectTechnologies, findMixedContent } = require('./detect');
 const { analyzeSecurityHeaders } = require('./headers-analysis');
 const { phpSupportStatus } = require('./php-support');
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const MAX_REQUESTS = 10;
 const TOTAL_MS = 8500;
 const CMS_IDS = ['wordpress', 'joomla', 'drupal'];

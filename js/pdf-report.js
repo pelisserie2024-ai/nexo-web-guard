@@ -189,14 +189,14 @@
     });
   }
 
-  function findingBlock(L, f, prevSource) {
+  function findingBlock(L, f, prevSource, difficulty) {
     var doc = L.doc;
     L.ensure(24);
     var col = SEV_COLOR[f.severity] || SEV_COLOR['Informativo'];
     var x0 = M;
     var w = L.badge(f.severity, col, x0, L.y);
     L.setText(8, false, C.muted);
-    doc.text('Confianza: ' + clean(f.confidence || 'No indicada') + (f.category ? '   |   ' + clean(f.category) : '') + (f.id ? '   |   ' + clean(f.id) : ''), x0 + w + 3, L.y);
+    doc.text('Confianza: ' + clean(f.confidence || 'No indicada') + (f.category ? '   |   ' + clean(f.category) : '') + (f.id ? '   |   ' + clean(f.id) : '') + (difficulty ? '   |   Para resolver: ' + clean(difficulty) : ''), x0 + w + 3, L.y);
     L.y += 5;
     L.para(f.title, { size: 10, bold: true, color: C.navy, gap: 1 });
     if (f.description) L.para(f.description, { size: 8.5 });
@@ -484,24 +484,46 @@
     var all = (r.findings || []);
     if (!all.length) L.para('No hay hallazgos registrados.', { size: 9 });
     var ordered = core.sortFindings(all);
+    var diffById = {};
+    ((r.improvementPlan && r.improvementPlan.items) || []).forEach(function (it) { diffById[it.id] = it.difficulty; });
     var prevSource = null;
-    ordered.forEach(function (f) { findingBlock(L, f, prevSource); prevSource = f.source || null; });
+    ordered.forEach(function (f) { findingBlock(L, f, prevSource, diffById[f.id]); prevSource = f.source || null; });
+
+    // Dónde reportar un sitio sospechoso (proveedor y registrador ya detectados; sin consultas nuevas)
+    L.h1('11. Dónde reportar un sitio sospechoso');
+    var ra = r.reportAdvice;
+    if (ra) {
+      if (ra.providers.length) {
+        ra.providers.forEach(function (p) {
+          L.para((p.abuseUrl ? p.name + ' (' + p.role + ')' : p.name + ' (' + p.role + ') - sin enlace fijo registrado'), { size: 9, bold: true, gap: 0.5 });
+          if (p.abuseUrl) L.link(p.abuseUrl, p.abuseUrl);
+        });
+      } else {
+        L.para('No se identificó un proveedor de hosting o CDN en este análisis.', { size: 9 });
+      }
+      L.para('Registrador del dominio: ' + (ra.registrar || 'No disponible') + '. ' + ra.registrarNote, { size: 9, gap: 1 });
+      L.para('Otros canales:', { size: 9, bold: true, gap: 0.5 });
+      ra.resources.forEach(function (x) { L.link(x.title, x.url); });
+      L.para('NEXO WEB GUARD no realiza denuncias ni ataques contra el sitio: estos son solo enlaces a los canales oficiales de cada proveedor.', { size: 8, color: C.muted, gap: 1 });
+    } else {
+      L.para('No disponible.', { size: 9 });
+    }
 
     // Comprobaciones no realizadas / limitaciones
-    L.h1('11. Comprobaciones no realizadas');
+    L.h1('12. Comprobaciones no realizadas');
     (r.notPerformed || []).forEach(function (t) { L.para('- ' + t, { size: 8.5, gap: 0.8 }); });
-    L.h1('12. Limitaciones del análisis');
+    L.h1('13. Limitaciones del análisis');
     (r.limitations || []).forEach(function (t) { L.para('- ' + t, { size: 8.5, gap: 0.8 }); });
     if (r.requests) L.para('Solicitudes realizadas al sitio: ' + r.requests.used + ' (máximo permitido: ' + r.requests.max + '). robots.txt consultado: ' + (r.robots && r.robots.checked ? 'sí' : 'no') + '.', { size: 8.5, color: C.muted });
 
     // Fuentes
-    L.h1('13. Fuentes oficiales consultadas');
+    L.h1('14. Fuentes oficiales consultadas');
     (r.sources || []).forEach(function (s) {
       L.link(s.title + ' - ' + s.url, s.url);
     });
 
     // Aviso
-    L.h1('14. Aviso importante');
+    L.h1('15. Aviso importante');
     L.para('Este informe procede de un análisis externo, pasivo y no intrusivo, basado en lo que el sitio publica en solicitudes de bajo impacto. No sustituye a una auditoría de seguridad autorizada ni garantiza la ausencia de vulnerabilidades. Las versiones indicadas son declaraciones del sitio y deben confirmarse con acceso autorizado al servidor. Los resultados no se han almacenado en ningún servidor.', { size: 9 });
 
     // Pie de página en todas las páginas
